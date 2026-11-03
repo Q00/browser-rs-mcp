@@ -968,15 +968,34 @@ impl Page {
     }
 
     async fn wait_for_load(&self) -> Result<()> {
-        let mut rx = self.client.events();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let rx = self.client.events();
+        self.wait_for_load_on(rx).await
+    }
+
+    /// Wait for the page's load event on an already-subscribed event stream.
+    /// Once the DOM is ready (DOMContentLoaded), the load event gets at most
+    /// a few more seconds: heavy pages (ads, trackers, endless images) may not
+    /// fire it for tens of seconds although the document is usable, and every
+    /// act tool waited the full 30 s for them.
+    async fn wait_for_load_on(
+        &self,
+        mut rx: tokio::sync::broadcast::Receiver<CdpEvent>,
+    ) -> Result<()> {
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut dom_ready = false;
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Ok(ev)) => {
-                    if ev.session_id.as_deref() == Some(&self.session_id)
-                        && ev.method == "Page.loadEventFired"
-                    {
+                    if ev.session_id.as_deref() != Some(&self.session_id) {
+                        continue;
+                    }
+                    if ev.method == "Page.loadEventFired" {
                         return Ok(());
+                    }
+                    if ev.method == "Page.domContentEventFired" && !dom_ready {
+                        dom_ready = true;
+                        deadline =
+                            deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                 }
                 Ok(Err(_)) => return Ok(()), // lagged/closed: proceed best-effort
@@ -3186,6 +3205,10 @@ impl Page {
         let entries = hist.get("entries").and_then(Value::as_array);
         if let Some(entry) = entries.and_then(|e| e.get((idx - 1) as usize)) {
             if let Some(id) = entry.get("id").and_then(Value::as_i64) {
+                // Subscribe before navigating so no event is missed. Going back
+                // within a single-page app is a same-document navigation that
+                // never fires a load event: waiting for one cost 30 s.
+                let mut rx = self.client.events();
                 self.client
                     .send_on(
                         &self.session_id,
@@ -3193,7 +3216,40 @@ impl Page {
                         json!({ "entryId": id }),
                     )
                     .await?;
-                let _ = self.wait_for_load().await;
+                // Done when: the traversal stayed in the document, the frame
+                // stopped loading, or the load event fired. Nothing at all
+                // within 1 s: nothing is loading. Once the DOM is ready the
+                // load gets at most 5 s more (as in wait_for_load_on).
+                let sid = self.session_id.clone();
+                let mut deadline = tokio::time::Instant::now() + Duration::from_millis(1_000);
+                let mut loading = false;
+                let mut dom_ready = false;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Ok(ev)) if ev.session_id.as_deref() == Some(&sid) => {
+                            match ev.method.as_str() {
+                                "Page.navigatedWithinDocument"
+                                | "Page.frameStoppedLoading"
+                                | "Page.loadEventFired" => break,
+                                "Page.frameStartedLoading" | "Page.frameRequestedNavigation"
+                                    if !loading =>
+                                {
+                                    loading = true;
+                                    deadline =
+                                        tokio::time::Instant::now() + Duration::from_secs(30);
+                                }
+                                "Page.domContentEventFired" if !dom_ready => {
+                                    dom_ready = true;
+                                    deadline = deadline
+                                        .min(tokio::time::Instant::now() + Duration::from_secs(5));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
             }
         }
         Ok(())
