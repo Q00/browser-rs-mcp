@@ -1960,14 +1960,19 @@ impl Page {
         let mut rx = self.client.events();
         let sid = self.session_id.clone();
         // Phase 1: within a short window, detect whether a navigation began.
+        // A same-document navigation (history.pushState in a single-page app)
+        // never fires Page.loadEventFired, so it must not wait for a load: it
+        // takes the no-navigation path below (DOM grace + two paint frames).
+        // Waiting for the load there cost the full 30 s on every SPA link click.
         let detected = tokio::time::timeout(Duration::from_millis(400), async {
             loop {
                 match rx.recv().await {
                     Ok(ev) if ev.session_id.as_deref() == Some(&sid) => match ev.method.as_str() {
                         "Page.loadEventFired" => return Some(true),
-                        "Page.frameStartedLoading"
-                        | "Page.frameRequestedNavigation"
-                        | "Page.navigatedWithinDocument" => return Some(false),
+                        "Page.frameStartedLoading" | "Page.frameRequestedNavigation" => {
+                            return Some(false)
+                        }
+                        "Page.navigatedWithinDocument" => return None,
                         _ => {}
                     },
                     Ok(_) => {}
