@@ -1786,7 +1786,7 @@ impl Page {
                     .send_on(
                         session_id,
                         "Input.dispatchKeyEvent",
-                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 8 }),
+                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": modifier_native_key_code(16), "modifiers": 8 }),
                     )
                     .await?;
                 shift_held = true;
@@ -1869,7 +1869,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_vk, "modifiers": modifiers }),
+                json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_native_key_code(modifier_vk), "modifiers": modifiers }),
             )
             .await?;
         if typing_delay(cancel, sample_lognormal_ms(34.0, 0.28, 15, 90))
@@ -1936,7 +1936,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": 0 }),
+                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": modifier_native_key_code(vk), "modifiers": 0 }),
             )
             .await?;
         Ok(())
@@ -1947,7 +1947,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 0 }),
+                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": modifier_native_key_code(16), "modifiers": 0 }),
             )
             .await?;
         Ok(())
@@ -3930,6 +3930,25 @@ fn minimum_jerk(u: f64) -> f64 {
     10.0 * u.powi(3) - 15.0 * u.powi(4) + 6.0 * u.powi(5)
 }
 
+/// Native key code for a standalone modifier key event (Shift, Control, Alt,
+/// Meta).
+///
+/// On macOS Chrome reads `nativeVirtualKeyCode` as an AppKit key code and
+/// routes unhandled key-downs through the application menu's key
+/// equivalents. A modifier-only key-down carrying any non-zero native code
+/// (the Windows VK 16, or even the AppKit Shift code 56) is matched against
+/// the menu and opens `chrome://settings/help`, stealing focus from the page
+/// mid-typing whenever a shifted character (uppercase, `@`, ...) is typed.
+/// Real AppKit modifier presses arrive as `flagsChanged`, never as key-downs,
+/// so 0 is the faithful value there. Pages never observe this field.
+fn modifier_native_key_code(windows_vk: u32) -> u32 {
+    if cfg!(target_os = "macos") {
+        0
+    } else {
+        windows_vk
+    }
+}
+
 /// Whether producing this character on a US keyboard requires the Shift key
 /// (uppercase letters and the shifted symbol row). Typing e.g. '@' without a
 /// modifier is physically impossible for a human — a behavioral tell.
@@ -4363,6 +4382,14 @@ mod tests {
         assert_eq!(minimum_jerk(0.0), 0.0);
         assert_eq!(minimum_jerk(0.5), 0.5);
         assert_eq!(minimum_jerk(1.0), 1.0);
+    }
+
+    #[test]
+    fn modifier_events_carry_no_native_code_on_macos() {
+        for vk in [16, 17, 18, 91] {
+            let expected = if cfg!(target_os = "macos") { 0 } else { vk };
+            assert_eq!(super::modifier_native_key_code(vk), expected);
+        }
     }
 
     #[test]
